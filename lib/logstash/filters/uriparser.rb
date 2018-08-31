@@ -12,28 +12,32 @@ class LogStash::Filters::Uriparser < LogStash::Filters::Base
 
   config_name "uriparser"
   
-  # source and target fields
+  # source fields
   config :source, :validate => :string, :default => "uri"
 
+  # target field
   config :target, :validate => :string
 
   # output fields
-  # "query_values" IS NOT RUNNING.
-  config :fields, :validate => :array, :default => ["uri", "scheme", "host", "domain", "port", "query", "query_values", "path", "user", "password", "fragment"]
+  config :fields, :validate => :array, :default => ["uri", "scheme", "host", "domain", "port", "query", "path", "user", "password", "fragment"]
 
-  # style of query_values: "vr" or "hr" 
-  # NOT RUNNING.
-  config :query_values_style, :validate => :string, :default => "hr"
+  # style of query: "str", "hr" or "vr"
+  # "str": "keyA=valueA&keyB=valueB&..."
+  # "hr": { "keyA" => "valueA", "keyB" => "valueB", ... }
+  # "vr": [ {"key" => "keyA", "value" => "valueA"}, {"key" => "keyB", "value" => "valueB"}, ... ]
+  config :query_style, :validate => :string, :default => "str"
+
+  # set key to the value of query without key
+  # if true, key set "_key<NUMBER>".
+  # if false, key set nil.
+  # this option is valid when query_style is "vr"
+  config :query_set_key_to_nokey, :validate => :boolean, :default => true
 
   # append values to the `tags` field when an exception is thrown
   config :tag_on_failure, :validate => :array, :default => ["_uriparserfailure"]
 
   public
   def register
-    # target
-    if @target.nil?
-      @target = @source
-    end
 
     # fields
     @_fields = []
@@ -43,7 +47,7 @@ class LogStash::Filters::Uriparser < LogStash::Filters::Base
 
     # flags
     @f_domain = @_fields.include?(:domain)
-    @query_values_mode = @_fields.include?(:query_values) ? @query_values_style.to_sym : nil
+    @query_mode = @_fields.include?(:query) ? @query_style.to_sym : nil
     PublicSuffix::List.private_domains = false
   end # def register
 
@@ -51,8 +55,16 @@ class LogStash::Filters::Uriparser < LogStash::Filters::Base
   def filter(event)
     begin
       parsed_uri = parse(event.get(@source))
-      event.remove(target)
-      event.set(target, parsed_uri)
+      
+      if @target.nil?
+        parsed_uri.each{ |k,v|
+          event.set(k, v)
+        }
+      else
+        event.remove(@target)
+        event.set(@target, parsed_uri)
+      end
+
     rescue => e
       @tag_on_failure.each{|tag| event.tag(tag)}
     end
@@ -72,21 +84,41 @@ class LogStash::Filters::Uriparser < LogStash::Filters::Base
       ret.keep_if{ |k, v| !v.nil? && @_fields.include?(k) }
       ret.store(:domain, get_domain(uri.host)) if @f_domain
       
-      #### unknown bug...failed to index to amazon es.
-      # query_values = uri.query_values
-      # unless query_values.nil?
-      #   case @query_values_mode
-      #   when :hr
-      #     ret.store(:query_values, query_values)
-      #   when :vr
-      #     query_values_vr = []
-      #     query_values.each{ |k,v| query_values_vr << { :key => k, :value => v } }
-      #     ret.store(:query_values, query_values_vr)
-      #     logger.debug( "query_values", :query_values => query_values, :query_values_vr => query_values_vr )
-      #   end
-      # end
-      #
+      # uri.query_values have unknown bug...
+      # so, create query_values from query manually.
+      query = uri.query
+      return ret if query.nil?
+      
+      case @query_mode
+      when :hr
+        query_values = Hash.new([])
+        cnt = 0
+        query.split("&").each{ |kv| 
+          if kv.include?("=")
+            kv_elem = kv.split("=") 
+            query_values.store( kv_elem[0], :value => kv_elem[1] )
+          else
+            query_values.store( ( @query_set_key_to_nokey ? "_key" + cnt.to_s : nil), kv )
+            cnt += 1
+          end
+        }
+        ret.store(:query, query_values)
+      when :vr
+        query_values = []
+        cnt = 0
+        query.split("&").each{ |kv| 
+          if kv.include?("=")
+            kv_elem = kv.split("=") 
+            query_values << { :key => kv_elem[0], :value => kv_elem[1] }
+          else
+            query_values << { :key => ( @query_set_key_to_nokey ? "_key" + cnt.to_s : nil), :value => kv }
+            cnt += 1
+          end
+        }
+        ret.store(:query, query_values)
+      end
       return ret
+
     when Array
       ret_values = []
       value.each { |v| ret_values << parse(v) }
